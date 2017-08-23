@@ -1,0 +1,498 @@
+/*************************************************************************
+* HISTORY:
+*    16/09/15 - Diego Maranhão - Adicionada lógica para verificar se conta
+*                               advém do CRM.
+*    17/09/15 - Márcio Cabral - Adicionadas instruções 'before update' e 
+*                               'before delete' para, assim como 'before
+*                               insert', fazer a validação dos RecordTypes
+*                               no lugar das regras de validação, uma vez
+*                               que o custom setting PARAMETROS CRM não
+*                               pode ser usado por serdo tipo list.
+* 26/02/16 - Gilmar Jorge  - Adicionada lógica para não entrar em 
+*                               funcionalidade existente antes da trigger
+*                               ser adaptada para entrar no before delete.
+*                               E chamada do método que apaga a atuacao da
+*                               Account deletada(GAPS).
+*************************************************************************/
+trigger Account on Account (before insert, after insert, after update, before update, before delete)    {
+    /******************************************************************************************
+    Projeto:        MDM
+    Author:         Diogo Cunha
+    Company:        Accenture
+    Description:    Verificação que impede o disparo da trigger caso o usuário seja de RECONCILIACAO
+    Data: 15/02/2016
+    *****************************************Início*********************************************/
+    if( Userinfo.getUserId() == Label.GAPS_1_USER_BY_BASS_RECONCILIACAO ) return;
+    /*****************************************Fim***********************************************/
+    
+    //26/02/2016 - Gilmar Jorge
+    if(!Trigger.isDelete){  
+    /*------------------------------------------------------------
+    Autor: Diego Maranhão
+    Empresa: SFDC Recife - Accenture
+    Descrição: Validação utilizada para verificar se o RecordType do registro
+               é advindo do CRM, parametrizado na Configuração Personalizada
+               PARAMETROS CRM. Se for não deve ser incluído nas validações e/ou
+               verificações.
+    History
+    16/09/2015 Diego Maranhão - Criação
+    ------------------------------------------------------------*/
+    /* INICIO -----------------------------------------------------------------------------*/
+    if (ConfiguracaoPersonalizadaParametrosCRM.validarAtivacaoTrigger(Trigger.new[0].RecordTypeId))
+        return;
+    /* FIM --------------------------------------------------------------------------------*/
+
+
+    Set<Id> prestadoresIds = new Set <Id>();
+    Set<Id> seguradoPadraoOldNew = new  Set<Id>();
+    Set<Id> contasCUSS = new Set<Id>();
+    Set<Id> seguradoPadrao = new Set<Id>();
+    Set< Double > ucPrestadores = new Set< Double >();
+    Set< String > ufPrestadores = new Set< String >();
+    List< Account > prestadores = new List< Account >();
+    List<Account> contasHistorico = new List<Account>();
+    Map<Id, Id> antigoSeguradoPadrao = new Map<Id, Id>();
+    Account oldConta;
+
+
+    Map<String, Schema.RecordTypeInfo > contaRecordTypes = Account.sObjectType.getDescribe().getRecordTypeInfosByName();
+    Id recordTypeSegurado           = contaRecordTypes.get('Segurado').getRecordTypeId();
+    Id recordTypePrestador          = contaRecordTypes.get('Prestador').getRecordTypeId();
+    Boolean regraPrestadorDirecionadoAtiva = ParametrizacoesDAO.prestadorDirecionado();
+
+
+    Set<ID> segPadraoTrocaCuss = new Set<ID>();
+
+    for (Account conta : Trigger.new ) {
+
+
+        // Caso os registros sejam inseridos manualmente o semáforo não será necessário,
+        // neste caso o campo COD_CONTA__c estará nulo, anulando também o semáforo
+        if (Trigger.isBefore)
+            if (SemaphoreFlagsControl.setNewCode(conta.COD_CONTA__c, 'AccountBefore')) continue;
+        else
+            if (SemaphoreFlagsControl.setNewCode(conta.COD_CONTA__c, 'AccountAfter'))   continue;
+
+
+        if (Trigger.isUpdate)
+            oldConta = Trigger.oldMap.get(conta.Id);
+
+
+        if (Trigger.isBefore && (conta.RecordTypeId == recordTypePrestador || conta.RecordTypeId == recordTypeSegurado)) {
+
+
+            conta.CEP_da_Correspondencia__c =  MaskHelper.cepMask(conta.CEP_da_Correspondencia__c );
+            conta.NUM_DDD_TEL_CELULAR__c =  MaskHelper.phoneMask(conta.NUM_DDD_TEL_CELULAR__c  );
+            conta.NUM_DDD_TEL_COMERC__c  =  MaskHelper.phoneMask(conta.NUM_DDD_TEL_COMERC__c  );
+            conta.Phone =  MaskHelper.phoneMask(conta.Phone);
+            conta.NUM_DDD_TEL_COBRANCA__c =  MaskHelper.phoneMask(conta.NUM_DDD_TEL_COBRANCA__c);
+
+
+        }
+
+
+        if (Trigger.isBefore && conta.RecordTypeId == recordTypePrestador) {
+
+
+            if (String.isBlank(conta.IDC_STATUS_PROG_SAUDE_ATIVA__c))
+                conta.IDC_STATUS_PROG_SAUDE_ATIVA__c = 'Inativo';
+
+
+            conta.CNPJ__c =  MaskHelper.cnpjMask(conta.CNPJ__c);
+
+
+            if ( Trigger.isInsert || (oldConta.FLG_PREST_SAUDE_ATIVA__c != conta.FLG_PREST_SAUDE_ATIVA__c && conta.FLG_PREST_SAUDE_ATIVA__c) )
+                conta.IDC_STATUS_PROG_SAUDE_ATIVA__c =  'Ativo';
+
+
+            if ( Trigger.isUpdate && oldConta.IDC_STATUS_PROG_SAUDE_ATIVA__c != conta.IDC_STATUS_PROG_SAUDE_ATIVA__c
+                && conta.IDC_STATUS_PROG_SAUDE_ATIVA__c == 'Inativo') {
+
+
+                if (String.isNotBlank(conta.DSC_JUSTIF_INATIV_SAUDE_ATIVA__c))
+                    conta.DSC_JUSTIF_INATIV_SAUDE_ATIVA__c = conta.DSC_JUSTIF_INATIV_SAUDE_ATIVA__c.toUpperCase();
+                prestadoresIds.add(conta.Id);
+
+
+            }
+
+            // Quando o prestador for direcionado o usuario irá informar qual fila deve ser direcionada
+            if ( conta.Prestador_Direcionado__c && regraPrestadorDirecionadoAtiva ) {
+                // O campo regiao é o campo utilizado pelos WF para encaminhar a Guia para fila correta
+                conta.Regiao__c = conta.SetorAdministrativo__c;
+            }
+            else if ( conta.UC__c != null && conta.Estado_da_Correspondencia__c != null ) {
+                // Quando o prestador não é direciona ou especial ele deve ser direcionado para a fila
+                // de acordo com o cadastrado de Unidade de Credenciamento
+                ucPrestadores.add( conta.UC__c );
+                ufPrestadores.add( conta.Estado_da_Correspondencia__c );
+                prestadores.add( conta );
+
+            }
+        }
+
+
+        if (Trigger.isBefore && conta.RecordTypeId == recordTypeSegurado) {
+
+            if ( Trigger.isUpdate && oldConta.COD_BENEF_UNICO__c != conta.COD_BENEF_UNICO__c )
+                conta.COD_BENEF_UNICO_ANT__c =  oldConta.COD_BENEF_UNICO__c;
+
+
+            if ( Trigger.isInsert || oldConta.NUM_CPF__c != conta.NUM_CPF__c )
+                conta.NUM_CPF__c =  MaskHelper.cpfMask(conta.NUM_CPF__c);
+
+
+        }
+
+
+        if (Trigger.isAfter && conta.RecordTypeId == recordTypeSegurado) {
+
+
+            if (Trigger.isInsert) {
+                //Insere no mapa de historico
+                contasHistorico.add(conta);
+                //verifica se tem carteirinha padrão
+                if (conta.COD_SEGURADO_PADRAO__c != null) seguradoPadrao.add(conta.COD_SEGURADO_PADRAO__c);
+
+
+            }
+            else {
+
+                // Verifica os campos que devem gerar historico
+                if (    oldConta.COD_SEGURADO_PADRAO__c != conta.COD_SEGURADO_PADRAO__c     ||
+                        oldConta.COD_STATUS_BENEF__c != conta.COD_STATUS_BENEF__c           ||
+                        oldConta.Name != conta.Name                                         ||
+                        oldConta.DAT_NASCIMENTO__c != conta.DAT_NASCIMENTO__c               ||
+                        oldConta.IDC_SEXO__c != conta.IDC_SEXO__c                           ||
+                        oldConta.NUM_CPF__c != conta.NUM_CPF__c                             ||
+                        (   oldConta.COD_BENEF_UNICO__c != conta.COD_BENEF_UNICO__c /*&&
+                            oldConta.COD_BENEF_UNICO_ANT__c == conta.COD_BENEF_UNICO_ANT__c*/
+                        )
+                    ) {
+
+                    contasHistorico.add(conta);
+
+
+                    if (conta.COD_SEGURADO_PADRAO__c != null)   seguradoPadrao.add(conta.COD_SEGURADO_PADRAO__c);
+
+
+                    if (oldConta.COD_SEGURADO_PADRAO__c != conta.COD_SEGURADO_PADRAO__c) {
+
+
+                        if (conta.COD_SEGURADO_PADRAO__c != null)
+                            seguradoPadraoOldNew.add(conta.COD_SEGURADO_PADRAO__c);
+                        if (oldConta.COD_SEGURADO_PADRAO__c != null)
+                            seguradoPadraoOldNew.add(oldConta.COD_SEGURADO_PADRAO__c);
+
+
+                    }
+
+                    // Verifica se houve troca do cuss
+                    if ( (  oldConta.COD_BENEF_UNICO__c != conta.COD_BENEF_UNICO__c     /*&&
+                            oldConta.COD_BENEF_UNICO_ANT__c == conta.COD_BENEF_UNICO_ANT__c*/)    ||
+                         (  oldConta.COD_SEGURADO_PADRAO__c != null &&
+                            conta.COD_SEGURADO_PADRAO__c != null        &&
+                            oldConta.COD_SEGURADO_PADRAO__c != conta.COD_SEGURADO_PADRAO__c)
+                        ) {
+
+
+                        contasCUSS.add(conta.Id);
+
+
+                        if (conta.COD_SEGURADO_PADRAO__c != null) segPadraoTrocaCuss.add(conta.COD_SEGURADO_PADRAO__c);
+
+                        if ( oldConta.COD_SEGURADO_PADRAO__c != conta.COD_SEGURADO_PADRAO__c &&
+                             oldConta.COD_SEGURADO_PADRAO__c != null                            &&
+                             conta.COD_SEGURADO_PADRAO__c != null) {
+                           antigoSeguradoPadrao.put(conta.COD_SEGURADO_PADRAO__c, oldConta.COD_SEGURADO_PADRAO__c);
+
+                        }
+                    }
+
+
+
+                }
+            }
+        }
+
+         /* CM - 31/10/2016 - START - Quando é before update e troca do carteirinha padrao*/
+            else if (Trigger.isBefore && Trigger.isUpdate &&
+                      conta.RecordTypeId == recordTypeSegurado && 
+                      oldConta.COD_SEGURADO_PADRAO__c != conta.COD_SEGURADO_PADRAO__c &&
+                      oldConta.COD_SEGURADO_PADRAO__c != null &&
+                      conta.COD_SEGURADO_PADRAO__c != null
+                    ) 
+            {
+                antigoSeguradoPadrao.put(conta.COD_SEGURADO_PADRAO__c, oldConta.COD_SEGURADO_PADRAO__c);
+            }
+			else if(Trigger.isBefore && Trigger.isInsert &&
+                    conta.RecordTypeId == recordTypeSegurado)
+            {
+                //Se for insert também preenche a lista - LMoura 20/01/17
+				//add na lista
+                //System.debug('Entrou na correção cod seg:'+conta.COD_SEGURADO_PADRAO__c);
+                antigoSeguradoPadrao.put(conta.COD_SEGURADO_PADRAO__c, conta.COD_SEGURADO_PADRAO__c);
+            }
+        /* CM - 31/10/2016 - END */
+            
+        }
+/*        
+        if (!ucPrestadores.isEmpty()) {
+            Map< String, Parametrizacoes__c > unidadesDeCredenciamento = ParametrizacoesDAO.unidadesDeCredenciamento(ucPrestadores, ufPrestadores);
+            
+            if(!unidadesDeCredenciamento.isEmpty()) {
+                
+                for ( Account prestador : prestadores ) {
+                    //String lKey = prestador.UC__c.format().replace('.','') + '|' + String.valueof(prestador.Estado_da_Correspondencia__c);
+                    String lKey = prestador.UC__c.format().replace('.','') + '|' + String.valueof(mapEndereco.get(prestador.id).estado__c);//String.valueof(prestador.Estado_da_Correspondencia__c); //28/01/2016 - Gilmar Jorge
+                    Parametrizacoes__c unidadeCredenciamento = unidadesDeCredenciamento.get( lkey );
+                    
+                    if( unidadeCredenciamento == null ) continue;
+                    
+                    prestador.Regiao__c = unidadeCredenciamento.Fila__c;
+                }       
+            }
+        }
+*/        
+        // Verifica se o prestador não atende nenhum segurado Ativo em Programa para inativar
+        if(!prestadoresIds.isEmpty())
+        {    
+            
+            Set<String> statusValidos = new Set<String> {   statusEnum.STATUSA1, statusEnum.STATUSA2, statusEnum.STATUSD1, 
+                statusEnum.STATUSD2, statusEnum.STATUSD3, statusEnum.STATUSD4, 
+                statusEnum.STATUSD5, statusEnum.STATUSD6, statusEnum.STATUSD7, 
+                statusEnum.STATUSD8, statusEnum.STATUSD9, statusEnum.STATUSD10,
+                statusEnum.STATUSD11
+                };
+                    
+                    for ( ElegivelPrograma__c programasElegiveis : [    SELECT  Id, 
+                                                                    PrestadorElegivel__c, 
+                                                                    Segurado_del__c 
+                                                                    FROM    ElegivelPrograma__c 
+                                                                    WHERE   PrestadorElegivel__c = :prestadoresIds
+                                                                    AND Segurado_del__c != ''
+                                                                    AND StatusSeguradoPrograma__c =: statusValidos]) {
+                                                                        Trigger.newMap.get(programasElegiveis.PrestadorElegivel__c).addError('Não é possível "Inativar" um Prestador se o mesmo tiver Segurado(s) Ativos.');
+                                                                    }
+        }
+        
+        // Programa elegivel para fazer update no flag de envio por arquivo.
+        // Somente os elegiveis que não estão inativo, fora do intevalo de ( B1 a B8 e C1 a C8 )
+        if(!contasCUSS.isEmpty())
+        {      
+            Set<String> statusValidos = new Set<String> 
+            {   
+                statusEnum.STATUSA1, statusEnum.STATUSA2, statusEnum.STATUSD1, 
+                    statusEnum.STATUSD2, statusEnum.STATUSD3, statusEnum.STATUSD4, 
+                    statusEnum.STATUSD5, statusEnum.STATUSD6, statusEnum.STATUSD7, 
+                    statusEnum.STATUSD8, statusEnum.STATUSD9, statusEnum.STATUSD10,
+                    statusEnum.STATUSD11, statusEnum.STATUSF1
+                    };
+                        
+                        for (List<ElegivelPrograma__c> programasElegiveis : [SELECT  Id,
+                                                                             EnviarArquivo__c 
+                                                                             FROM    ElegivelPrograma__c
+                                                                             WHERE   Segurado_del__c =: contasCUSS
+                                                                             AND     StatusSeguradoPrograma__c =: statusValidos]) {
+                                                                                 
+                                                                                 for (ElegivelPrograma__c programaElegivel : programasElegiveis)
+                                                                                     programaElegivel.EnviarArquivo__c = true;
+                                                                                 
+                                                                                 Database.update(programasElegiveis); 
+                                                                             }
+            
+            
+            //marca a alteracao no segurado
+        /*CM - 26/09/2016 - se comenta bloque do codigo que marca a carterinha padrao como alterada
+       /* List<SEGURADO__C> lsSeg = new List<SEGURADO__C>();
+        System.debug('\n **CM** segPadraoTrocaCuss ==>>>> \n'+segPadraoTrocaCuss);
+        for(Id idSeg : segPadraoTrocaCuss){
+            lsSeg.add(New SEGURADO__c(
+                ID               = idSeg,
+                FLG_ARQ_ENV__c   = true,
+                FLG_ALTERACAO__c = true,
+                FLG_BENEF_ALT__c = true
+            ));
+        }
+
+        if(!lsSeg.isEmpty()) Database.update(lsSeg, false);*/
+
+    }
+
+
+    //Busca as informações que falta para geração do historico
+    if (!contasHistorico.isEmpty()) {
+
+
+        Map<Id, SEGURADO__C> contasSegurados = new Map<Id, SEGURADO__C>();
+        List<SEGURADO_ADMINISTRATIVO_HIST__c> historicos = new List<SEGURADO_ADMINISTRATIVO_HIST__c>();
+
+        //Busca da carteirinha padrão o Codigo da Empresa, Grupo economico e a Carteira
+        for (SEGURADO__c segurado : [   SELECT  Id,
+
+
+                                                Name,
+                                                COD_CONTA_PESSOA__c,
+                                                COD_APOLICE__r.COD_APOLICE__c,
+                                                COD_APOLICE__r.COD_GRUPO_ECON_EMPRESA__r.Name,
+                                                COD_PRODUTO_SAUDE__r.COD_TIPO_PRODUTO__c,
+
+
+
+
+                                                COD_STATUS_BENEF__c,
+                                                DAT_STATUS_BENEF__c,
+                                                NME_BENEFICIARIO__c,
+                                                DAT_NASCIMENTO__c,
+                                                IDC_SEXO__c,
+                                                COD_MOTIV_STATUS__c
+                                        FROM SEGURADO__c WHERE Id=: seguradoPadrao]) {
+            contasSegurados.put(segurado.COD_CONTA_PESSOA__c, segurado);
+        }
+
+
+        for (Account conta : contasHistorico) {
+
+
+            SEGURADO__c segurado = contasSegurados.get(conta.Id);
+
+
+            SEGURADO_ADMINISTRATIVO_HIST__c historico = new SEGURADO_ADMINISTRATIVO_HIST__c();
+
+
+            historico.DAT_MANUTENCAO__c     =  System.now();
+            historico.COD_CONTA_SEGURADO__c = conta.Id;
+            historico.NUM_CPF__c            = conta.NUM_CPF__c;
+            historico.COD_BENEF_UNICO__c    = conta.COD_BENEF_UNICO__c;
+
+
+            if (segurado != null && seguradoPadraoOldNew.contains(conta.COD_SEGURADO_PADRAO__c)) {
+                historico.DAT_NASCIMENTO__c     = segurado.DAT_NASCIMENTO__c;
+                historico.COD_IDENT_BENEF__c    = segurado.Name;
+                historico.NME_BENEFICIARIO__c   = segurado.NME_BENEFICIARIO__c;
+                historico.IDC_SEXO__c           = segurado.IDC_SEXO__c;
+
+                historico.COD_STATUS_BENEF__c   = segurado.COD_STATUS_BENEF__c ;
+                historico.COD_MOTIV_STATUS__c   = segurado.COD_MOTIV_STATUS__c ;
+            } else {
+                historico.DAT_NASCIMENTO__c =  conta.DAT_NASCIMENTO__c;
+                historico.NME_BENEFICIARIO__c = conta.Name;
+                historico.IDC_SEXO__c = conta.IDC_SEXO__c;
+                historico.COD_STATUS_BENEF__c = conta.COD_STATUS_BENEF__c;
+            }
+
+
+            if(segurado != null ) {
+                historico.COD_IDENT_BENEF__c    = segurado.Name;
+                historico.COD_CARTEIRA_IDENT__c = segurado.COD_PRODUTO_SAUDE__r.COD_TIPO_PRODUTO__c;
+                historico.COD_EMPRESA__c        = segurado.COD_APOLICE__r.COD_APOLICE__c;
+                historico.DAT_FIM_SUSPENSAO__c  = segurado.COD_STATUS_BENEF__c == 'Suspenso' ? segurado.DAT_STATUS_BENEF__c : NULL;
+                historico.DAT_INI_SUSPENSAO__c  = segurado.COD_STATUS_BENEF__c == 'Suspenso' ? segurado.DAT_STATUS_BENEF__c : NULL;
+                historico.GRUPO_ECONOMICO__c    = segurado.COD_APOLICE__r.COD_GRUPO_ECON_EMPRESA__r.Name;
+                historico.COD_MOTIV_STATUS__c   = segurado.COD_MOTIV_STATUS__c ;
+            }
+            historicos.add(historico);
+        }
+        if (!historicos.isEmpty()) Database.insert(historicos);
+    }
+
+
+
+
+    if (!antigoSeguradoPadrao.isEmpty()) {
+
+
+        Map<Id, Segurado__c> carteirinhaNome = new  Map<Id, Segurado__c>([SELECT    Id,
+                                                                                    Name,
+                                                                                    FRM_MOVIMENTACAO__c,    // CM 27/09/2016
+                                                                                    FLG_INATIVACAO__c,       // CM 27/09/2016
+                                                                                    // CM - 31/10/2016 - START - Campos da carteirinha que sao prenchinas na conta
+                                                                                    NUM_DDD_TEL_RESID__c,
+                                                                                    NUM_DDD_TEL_CELULAR__c,
+                                                                                    NUM_DDD_TEL_COMERC__c,
+                                                                                    NUM_DDD_TEL_COBRANCA__c,
+                                                                                    IDC_SEXO__c,
+                                                                                    DAT_NASCIMENTO__c,
+                                                                                    DSC_BAIRRO_RESID__c,
+                                                                                    DSC_COMPL_RESID__c,
+                                                                                    DSC_ENDERECO_RESID__c,
+                                                                                    DSC_MUNIC_RESID__c,
+                                                                                    NUM_CEP_RESID__c,
+                                                                                    SIG_UF_RESID__c,
+                                                                                    COD_STATUS_BENEF__c,
+                                                                                    DSC_EMAIL__c,
+                                                                                    COD_DV_BENEF__c,
+                                                                                    NUM_CPF__c
+                                                                                    // CM - 31/10/2016 - END
+                                                                          FROM      Segurado__c
+                                                                          WHERE     Id = :antigoSeguradoPadrao.values()
+                                                                          OR        Id = :antigoSeguradoPadrao.keySet() //CM - 26/09/2016
+                                                                          ]);
+
+
+        List<Segurado__c> seguradosAlterados = new List<Segurado__c>();
+
+
+        if(Trigger.isAfter)
+        {
+            for (Id segurado : antigoSeguradoPadrao.keySet()) {
+
+
+                Segurado__c alterado = new Segurado__c();
+                alterado.Id = segurado;
+                Segurado__c nomeAlterado = carteirinhaNome.get(antigoSeguradoPadrao.get(segurado));
+
+
+                //if (nomeAlterado != null) //CM - 27/09/2016
+                if (
+                    nomeAlterado != null && !nomeAlterado.FLG_INATIVACAO__c
+                    && !WBAUtils_cls.isTriggerSegurado //CM 25/11/2016
+                ) 
+                {
+                    /* CM - 27/09/2016 -START */
+                        alterado.COD_IDENT_BENEF_ANT__c = nomeAlterado.Name;
+                        if(String.isBlank(nomeAlterado.FRM_MOVIMENTACAO__c) && String.isBlank(carteirinhaNome.get(segurado).FRM_MOVIMENTACAO__c))
+                        {
+                            alterado.FLG_ALTERACAO__c = true;
+                            alterado.FLG_ARQ_ENV__c = true;
+                            alterado.FLG_BENEF_ALT__c = true;
+                        }
+                        seguradosAlterados.add(alterado);
+                    /* CM - 27/09/2016 -END vcs */ 
+                }
+            }
+        }
+
+        /* CM - 31/10/2016 -START - Preenche os valores da nova carteirinha padrao no objeto conta*/
+        else if(Trigger.isBefore)
+        {
+            for (Account conta : Trigger.new )
+            {
+                Segurado__c objSeg = carteirinhaNome.get(conta.COD_SEGURADO_PADRAO__c);
+                if(objSeg != null) // CM - 30/11/2016
+                {
+                    conta.phone                               = objSeg.NUM_DDD_TEL_RESID__c;
+                    conta.NUM_DDD_TEL_CELULAR__c              = objSeg.NUM_DDD_TEL_CELULAR__c;
+                    conta.NUM_DDD_TEL_COMERC__c               = objSeg.NUM_DDD_TEL_COMERC__c;
+                    conta.NUM_DDD_TEL_COBRANCA__c             = objSeg.NUM_DDD_TEL_COBRANCA__c;
+                    conta.IDC_SEXO__c                         = objSeg.IDC_SEXO__c;
+                    conta.DAT_NASCIMENTO__c                   = objSeg.DAT_NASCIMENTO__c;
+                    conta.Bairro_de_Correspondencia__c        = objSeg.DSC_BAIRRO_RESID__c;
+                    conta.Complemento_de_Correspondencia__c   = objSeg.DSC_COMPL_RESID__c;
+                    conta.Rua_de_Correspondencia__c           = objSeg.DSC_ENDERECO_RESID__c;
+                    conta.Cidade_de_Correspondencia__c        = objSeg.DSC_MUNIC_RESID__c;
+                    conta.CEP_da_Correspondencia__c           = objSeg.NUM_CEP_RESID__c;
+                    conta.Estado_da_Correspondencia__c        = objSeg.SIG_UF_RESID__c;
+                    conta.COD_STATUS_BENEF__c                 = objSeg.COD_STATUS_BENEF__c;
+                    conta.DSC_RESP_TEC_EMAIL__c               = objSeg.DSC_EMAIL__c;
+                    conta.COD_DV_BENEF__c                     = objSeg.COD_DV_BENEF__c;
+                    conta.NUM_CPF__c                          = objSeg.NUM_CPF__c;
+                }
+            }
+        }
+        /* CM - 31/10/2016 - END */
+
+        if (!seguradosAlterados.isEmpty()) Database.update(seguradosAlterados);
+    }
+  }
+}
